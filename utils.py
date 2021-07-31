@@ -4,179 +4,6 @@ import numpy as np
 import os
 from tensorflow.python.ops import summary_ops_v2
 import matplotlib.pyplot as plt
-import string
-from simple_elmo import ElmoModel
-
-physical_devices = tf.config.list_physical_devices('GPU')
-tf.config.experimental.set_memory_growth(physical_devices[0], enable=True)
-
-def load_elmoized_dataset(filename):
-    filenames = [filename]
-    raw_dataset = tf.data.TFRecordDataset(filenames)
-    print(f'Raw loaded dataset: {raw_dataset}')
-    dataset = raw_dataset.map(prepare_dataset_for_training)
-    return dataset
-
-def prepare_dataset_for_training(example):
-    context_features = {
-        'label': tf.io.FixedLenFeature([],tf.int64)}
-    sequence_features = {
-        'embeddings1': tf.io.VarLenFeature(tf.float32),
-        'embeddings2': tf.io.VarLenFeature(tf.float32)}
-    parsed_context, parsed_feature_lists = tf.io.parse_single_sequence_example(
-        example,
-        context_features=context_features,
-        sequence_features=sequence_features)
-    emb1 = tf.RaggedTensor.from_sparse(parsed_feature_lists['embeddings1'])
-    emb1 = tf.reshape(emb1.to_tensor(), shape=(1,30,1024))
-    emb2 = tf.RaggedTensor.from_sparse(parsed_feature_lists['embeddings2'])
-    emb2 = tf.reshape(emb2.to_tensor(), shape=(1,30,1024))
-    label = tf.expand_dims(parsed_context['label'], axis=0)
-    return ({'sentence1': emb1, 'sentence2': emb2}, label)
-
-def preprocess(sentence):
-    exclude = set(string.punctuation)
-    sent_proc = ''.join(char for char in sentence if char not in exclude)
-    sent_proc = ' '.join(sent_proc.split())
-    return sent_proc
-
-def lower_keep_punctuation(input_data):
-    '''For TextVectorization: I want lowercase,
-    but do not want to strip punctuation, which may be relevant
-    for long-distance dependencies.'''
-    return tf.strings.lower(input_data)
-
-def load_microsoft_ds(path):
-    '''Loading function for the microsoft paraphrase database. ELMO VERSION.
-    Also returns a raw dataset with both sentences for textvectorization purposes.'''
-    print(f'Processing {path}...')
-    with open(path) as f:
-        lines = f.readlines()
-    c = 0
-    pos = 0
-    labels = []
-    sents1 = []
-    sents2 = []
-    sents = []
-    max_length = 0
-    for line in lines:
-        if c > 0:
-            entries = line.split('\t')
-            label = int(entries[0])
-            if label == 1:
-                pos += 1
-            labels.append(label)
-            sent1 = preprocess(entries[3])
-            sent2 = preprocess(entries[4])
-            sent1_elmo = sent1.split()
-            sent2_elmo = sent2.split()
-            max_length = max(len(sent1.split()), len(sent2.split()), max_length)
-            sents1.append(sent1_elmo)
-            sents2.append(sent2_elmo)
-            sents.append(sent1 + ' ' + sent2)
-        c+=1
-    print(f'Total lines processed: {c}.')
-    print(f'Total positive labels: {pos}. Ratio = {pos/c}')
-    print(f'Length sents1 : {len(sents1)}')
-    print(f'Length sents2 : {len(sents2)}')
-    print(f'Length labels : {len(labels)}')
-    print(f'Max length of a sentence : {max_length}')
-
-    sents1 = tf.expand_dims(tf.constant(sents1, dtype=tf.string),axis=-1)
-    sents2 = tf.expand_dims(tf.constant(sents2, dtype=tf.string),axis=-1)
-    print(f'Shape of sents1 as tensor: {sents1.shape}')
-    print(f'Shape of sents2 as tensor: {sents2.shape}')
-    ds = tf.data.Dataset.from_tensor_slices(
-        ({'sentence1': sents1,
-        'sentence2': sents2},
-        tf.expand_dims(labels,-1)))
-    ds_raw = tf.data.Dataset.from_tensor_slices(
-        (tf.expand_dims(sents,-1)))
-    return ds, ds_raw
-
-def load_paws_ds(path, batch_size, shuffle_buffer_size=50000):
-    '''Loading function for the PAWS dataset.'''
-    df = pd.read_csv(path, sep='\t')
-    labels = df.pop('label')
-    df.drop('id', inplace=True, axis=1)
-    sents1 = tf.expand_dims(df.values[:,0],-1)
-    sents2 = tf.expand_dims(df.values[:,1],-1)
-    tar = tf.expand_dims(labels.values,-1)
-    ds = tf.data.Dataset.from_tensor_slices((
-        {'sentence1': sents1,
-        'sentence2': sents2},
-        tar))
-    ds = ds.shuffle(shuffle_buffer_size).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    return ds
-
-def plot_graphs(history, metric):
-  '''Plots graphs of training NNs'''
-  plt.plot(history.history[metric])
-  plt.plot(history.history['val_'+metric], '')
-  plt.xlabel("Epochs")
-  plt.ylabel(metric)
-  plt.legend([metric, 'val_'+metric])
-
-class TBCallback(tf.keras.callbacks.TensorBoard):
-    '''This is necessary for the Tensorboard callback to work with the
-    experimental preprocessing layer.'''
-    def _log_weights(self, epoch):
-        with self._train_writer.as_default():
-            with summary_ops_v2.always_record_summaries():
-                for layer in self.model.layers:
-                    for weight in layer.weights:
-                        if hasattr(weight, "name"):
-                            weight_name = weight.name.replace(':', '_')
-                            summary_ops_v2.histogram(weight_name, weight, step=epoch)
-                            if self.write_images:
-                                self._log_weight_as_image(weight, weight_name, epoch)
-                self._train_writer.flush()
-
-def get_run_logdir(root_logdir):
-    '''This is to create the name for the tensorboard log.'''
-    import time
-    run_id = time.strftime('run_%Y_%m_%d-%H_%M_%S')
-    return os.path.join(root_logdir, run_id)
-
-def load_w2v_embeddings(path_words, path_embeddings):
-    dfw = pd.read_csv(path_words,sep='\t', header=None)
-    dfe = pd.read_csv(path_embeddings,sep='\t', header=None)
-    emb_dic = {}
-    emb_size = 0
-    for i in range(len(dfw)):
-        word = dfw.iat[i,0]
-        emb = np.asarray(dfe.iloc[i], dtype='float32')
-        new_emb_size = len(emb)
-        if new_emb_size != emb_size:
-            emb_size = new_emb_size
-        emb_dic[word] = emb
-    return emb_dic, emb_size
-
-def get_embedding_matrix(embedding_size, vocab_size, word_index, embedding_dict):
-    embedding_matrix = np.zeros((vocab_size, embedding_size))
-    for word, i in word_index.items():
-        if i < vocab_size:
-            embedding_vector = embedding_dict.get(word)
-            if embedding_vector is not None:
-                embedding_matrix[i] = embedding_vector
-    return embedding_matrix
-
-def get_word_index(text_vec_layer):
-    vocabulary = text_vec_layer.get_vocabulary()
-    index = dict(zip(vocabulary, range(len(vocabulary))))
-    return index
-
-def load_glove_embeddings(path):
-    '''Loads the embeddings.
-    This functions changes based on the format of the data.'''
-    emb_index = {}
-    with open(path) as f:
-        for line in f:
-            values = line.split()
-            word = values[0]
-            coefs = np.asarray(values[1:],dtype='float32')
-            emb_index[word] = coefs
-    return emb_index
 
 def load_merged_ds(path_micr, path_paws_train, path_paws_val, batch_size, buffer_size=50000):
     print(f'Processing {path_micr}...')
@@ -255,6 +82,138 @@ def load_merged_ds(path_micr, path_paws_train, path_paws_val, batch_size, buffer
         labels))
     ds = ds.shuffle(50000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return ds
+
+def lower_keep_punctuation(input_data):
+    '''For TextVectorization: I want lowercase,
+    but do not want to strip punctuation, which may be relevant
+    for long-distance dependencies.'''
+    return tf.strings.lower(input_data)
+
+def load_microsoft_ds(path, buffer_size=50000,):
+    '''Loading function for the microsoft paraphrase database.
+    Also returns a raw dataset with both sentences for textvectorization purposes.'''
+    print(f'Processing {path}...')
+    with open(path) as f:
+        lines = f.readlines()
+    c = 0
+    pos = 0
+    labels = []
+    sents1 = []
+    sents2 = []
+    sents = []
+    for line in lines:
+        if c > 0:
+            entries = line.split('\t')
+            label = int(entries[0])
+            if label == 1:
+                pos += 1
+            labels.append(label)
+            sents1.append(entries[3])
+            sents2.append(entries[4])
+            sents.append(entries[3] + ' ' + entries[4])
+        c+=1
+    print(f'Total lines processed: {c}.')
+    print(f'Total positive labels: {pos}. Ratio = {pos/c}')
+    print(f'Length sents1 : {len(sents1)}')
+    print(f'Length sents2 : {len(sents2)}')
+    print(f'Length labels : {len(labels)}')
+    #You have to expand the -1 dimension, so that each element comes onto a separate line. Don't forget the double brackets.
+    ds = tf.data.Dataset.from_tensor_slices(
+        ({'sentence1': tf.expand_dims(sents1,-1),
+        'sentence2': tf.expand_dims(sents2,-1)},
+        tf.expand_dims(labels,-1)))
+    ds_raw = tf.data.Dataset.from_tensor_slices(
+        (tf.expand_dims(sents,-1)))
+    return ds, ds_raw
+
+def load_paws_ds(path):
+    '''Loading function for the PAWS dataset.'''
+    df = pd.read_csv(path, sep='\t')
+    labels = df.pop('label')
+    df.drop('id', inplace=True, axis=1)
+    sents1 = df.values[:,0]
+    sents2 = df.values[:,1]
+    sents = sents1 + ' ' + sents2
+    print(sents[:10])
+    sents1 = tf.expand_dims(sents1,-1)
+    sents2 = tf.expand_dims(sents2,-1)
+    sents = tf.expand_dims(sents,-1)
+    tar = tf.expand_dims(labels.values,-1)
+    ds = tf.data.Dataset.from_tensor_slices((
+        {'sentence1': sents1,
+        'sentence2': sents2},
+        tar))
+    raw_ds = tf.data.Dataset.from_tensor_slices((sents))
+    return ds, raw_ds
+
+def plot_graphs(history, metric):
+  '''Plots graphs of training NNs'''
+  plt.plot(history.history[metric])
+  plt.plot(history.history['val_'+metric], '')
+  plt.xlabel("Epochs")
+  plt.ylabel(metric)
+  plt.legend([metric, 'val_'+metric])
+
+class TBCallback(tf.keras.callbacks.TensorBoard):
+    '''This is necessary for the Tensorboard callback to work with the
+    experimental preprocessing layer.'''
+    def _log_weights(self, epoch):
+        with self._train_writer.as_default():
+            with summary_ops_v2.always_record_summaries():
+                for layer in self.model.layers:
+                    for weight in layer.weights:
+                        if hasattr(weight, "name"):
+                            weight_name = weight.name.replace(':', '_')
+                            summary_ops_v2.histogram(weight_name, weight, step=epoch)
+                            if self.write_images:
+                                self._log_weight_as_image(weight, weight_name, epoch)
+                self._train_writer.flush()
+
+def get_run_logdir(root_logdir):
+    '''This is to create the name for the tensorboard log.'''
+    import time
+    run_id = time.strftime('run_%Y_%m_%d-%H_%M_%S')
+    return os.path.join(root_logdir, run_id)
+
+def load_embeddings(path_words, path_embeddings):
+    dfw = pd.read_csv(path_words,sep='\t', header=None)
+    dfe = pd.read_csv(path_embeddings,sep='\t', header=None)
+    emb_dic = {}
+    emb_size = 0
+    for i in range(len(dfw)):
+        word = dfw.iat[i,0]
+        emb = np.asarray(dfe.iloc[i], dtype='float32')
+        new_emb_size = len(emb)
+        if new_emb_size != emb_size:
+            emb_size = new_emb_size
+        emb_dic[word] = emb
+    return emb_dic, emb_size
+
+def get_embedding_matrix(embedding_size, vocab_size, word_index, embedding_dict):
+    embedding_matrix = np.zeros((vocab_size, embedding_size))
+    for word, i in word_index.items():
+        if i < vocab_size:
+            embedding_vector = embedding_dict.get(word)
+            if embedding_vector is not None:
+                embedding_matrix[i] = embedding_vector
+    return embedding_matrix
+
+def get_word_index(text_vec_layer):
+    vocabulary = text_vec_layer.get_vocabulary()
+    index = dict(zip(vocabulary, range(len(vocabulary))))
+    return index
+
+def load_glove_embeddings(path):
+    '''Loads the embeddings.
+    This functions changes based on the format of the data.'''
+    emb_index = {}
+    with open(path) as f:
+        for line in f:
+            values = line.split()
+            word = values[0]
+            coefs = np.asarray(values[1:],dtype='float32')
+            emb_index[word] = coefs
+    return emb_index
 
 map_name_to_handle = {
     'bert_en_uncased_L-12_H-768_A-12':
